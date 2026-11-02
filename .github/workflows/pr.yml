@@ -1,0 +1,22 @@
+name: pr
+
+# Contribution check: vet and test on pull requests and pushes to main.
+# GitHub-hosted runner, read-only token, no secrets.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: GOWORK=off go vet ./...
+      - run: GOWORK=off go test -count=1 ./...
