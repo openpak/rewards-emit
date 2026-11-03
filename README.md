@@ -21,3 +21,12 @@ rw.Event(emit.Event{
 
 Only emit from the code path that proved the action. Metric names, the per-game signals and the
 caps are in the rewards repo's `docs/metrics.md`. Events are deduplicated by `ID` for 60 days.
+
+## Sessions (vendor hosts without a matchmaking store)
+
+`emit.NewSessions(rw, "game_sessions.<game>", 0)` plus `Watch(ctx, 20*time.Second, snapshot)` turns a host's room
+table into session events: a player counts once per room after `REWARDS_SESSION_MIN` (default 3 minutes) of
+unbroken time with at least one other mapped player. `snapshot` returns `[]emit.Room{ID, Players []Identity}`;
+a host that only sees join and leave events can keep an `emit.Registry` and pass `Registry.Snapshot`. Room ids
+must be unique over time (they are the dedupe key). For a Switch title the identity is
+`{Namespace: "switch", Subject: <BAAS user id>}`.
