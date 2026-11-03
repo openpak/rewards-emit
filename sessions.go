@@ -1,7 +1,9 @@
 package emit
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"sort"
 	"sync"
@@ -191,4 +193,28 @@ func (g *Registry) Snapshot() []Room {
 		out = append(out, r)
 	}
 	return out
+}
+
+// PersistSessions keeps the session clock in the emit database under name: it restores a saved clock now
+// and saves the clock after every tick when it changed. It does nothing without REWARDS_EMIT_DATABASE_URL.
+// Call it before Watch.
+func (c *Client) PersistSessions(name string, s *Sessions) {
+	if c == nil || s == nil || c.store() == nil {
+		return
+	}
+	if b, ok := c.LoadState(name); ok {
+		var st State
+		if json.Unmarshal(b, &st) == nil {
+			s.Restore(st)
+		}
+	}
+	var last []byte
+	s.SetOnTick(func(st State) {
+		b, err := json.Marshal(st)
+		if err != nil || bytes.Equal(b, last) {
+			return
+		}
+		c.SaveState(name, b)
+		last = b
+	})
 }

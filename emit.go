@@ -67,8 +67,13 @@ type Config struct {
 	Batch     int    // default 50 (the service takes at most 100)
 	Flush     time.Duration
 	// MaxAge is how long an undelivered event is kept before it is dropped. Default 6 h.
+	// With DatabaseURL set the default is 7 days.
 	MaxAge time.Duration
 	HTTP   *http.Client
+	// DatabaseURL (REWARDS_EMIT_DATABASE_URL) makes the queue durable in Postgres (schema "emit").
+	DatabaseURL string
+
+	store store // tests inject a fake
 }
 
 // Client queues events and delivers them in the background.
@@ -80,6 +85,9 @@ type Client struct {
 	closed  atomic.Bool
 	dropped atomic.Int64
 	sent    atomic.Int64
+
+	smu sync.RWMutex
+	st  store // nil until the database is reachable (or never, without DatabaseURL)
 }
 
 // FromEnv builds a Client from REWARDS_EVENTS_URL and REWARDS_EVENTS_KEY (or
@@ -91,7 +99,8 @@ func FromEnv(source string) *Client {
 			key = strings.TrimSpace(string(b))
 		}
 	}
-	return New(Config{URL: os.Getenv("REWARDS_EVENTS_URL"), Key: key, Source: source})
+	return New(Config{URL: os.Getenv("REWARDS_EVENTS_URL"), Key: key, Source: source,
+		DatabaseURL: os.Getenv("REWARDS_EMIT_DATABASE_URL")})
 }
 
 // New starts the background sender. With no URL or Key the client is disabled.
@@ -110,14 +119,22 @@ func New(cfg Config) *Client {
 	if c.cfg.Flush <= 0 {
 		c.cfg.Flush = 2 * time.Second
 	}
+	durable := cfg.DatabaseURL != "" || cfg.store != nil
 	if c.cfg.MaxAge <= 0 {
 		c.cfg.MaxAge = 6 * time.Hour
+		if durable {
+			c.cfg.MaxAge = 7 * 24 * time.Hour
+		}
 	}
 	if c.cfg.HTTP == nil {
 		c.cfg.HTTP = &http.Client{Timeout: 10 * time.Second}
 	}
 	c.cfg.URL = strings.TrimRight(c.cfg.URL, "/")
 	c.q = make(chan wireEvent, c.cfg.QueueSize)
+	c.st = cfg.store
+	if c.st == nil && cfg.DatabaseURL != "" {
+		c.connect()
+	}
 	c.wg.Add(1)
 	go c.run()
 	return c
@@ -169,14 +186,168 @@ func (c *Client) Close(ctx context.Context) {
 	}
 }
 
+func (c *Client) store() store {
+	c.smu.RLock()
+	defer c.smu.RUnlock()
+	return c.st
+}
+
+// connect tries to open the database once; on failure it logs loudly and the memory queue is used meanwhile.
+func (c *Client) connect() {
+	if c.cfg.DatabaseURL == "" || c.store() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	st, err := openPG(ctx, c.cfg.DatabaseURL)
+	if err != nil {
+		log.Printf("rewards-emit: DATABASE UNREACHABLE (%v); events are held in memory only until it connects", err)
+		return
+	}
+	c.smu.Lock()
+	c.st = st
+	c.smu.Unlock()
+	log.Printf("rewards-emit: durable queue in Postgres (schema emit, source %s)", c.cfg.Source)
+}
+
+func dbctx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+// persist writes one event to the database; false means it is not there (keep it in memory).
+func (c *Client) persist(w wireEvent) bool {
+	st := c.store()
+	if st == nil {
+		return false
+	}
+	b, err := json.Marshal(w)
+	if err != nil {
+		return true
+	}
+	ctx, cancel := dbctx()
+	defer cancel()
+	if err := st.insert(ctx, c.cfg.Source, w.EventID, b); err != nil {
+		log.Printf("rewards-emit: database write failed (%v); holding in memory", err)
+		return false
+	}
+	return true
+}
+
+// LoadState reads a durable value kept for this source. It reports false without a database.
+func (c *Client) LoadState(name string) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	st := c.store()
+	if st == nil {
+		return nil, false
+	}
+	ctx, cancel := dbctx()
+	defer cancel()
+	v, ok, err := st.loadState(ctx, c.cfg.Source, name)
+	if err != nil {
+		log.Printf("rewards-emit: load state %q: %v", name, err)
+		return nil, false
+	}
+	return v, ok
+}
+
+// SaveState stores a durable value for this source. It does nothing without a database.
+func (c *Client) SaveState(name string, v []byte) {
+	if c == nil {
+		return
+	}
+	st := c.store()
+	if st == nil {
+		return
+	}
+	ctx, cancel := dbctx()
+	defer cancel()
+	if err := st.saveState(ctx, c.cfg.Source, name, v); err != nil {
+		log.Printf("rewards-emit: save state %q: %v", name, err)
+	}
+}
+
+// deliverDB sends pending rows oldest first until none are left, a batch fails, or (when final) once.
+// It reports whether the database queue is drained or delivery should back off.
+func (c *Client) deliverDB(st store) bool {
+	ctx, cancel := dbctx()
+	if n, err := st.purge(ctx, c.cfg.Source, time.Now().Add(-c.cfg.MaxAge)); err != nil {
+		log.Printf("rewards-emit: purge: %v", err)
+	} else if n > 0 {
+		c.dropped.Add(n)
+	}
+	cancel()
+	for {
+		ctx, cancel := dbctx()
+		rows, err := st.pending(ctx, c.cfg.Source, c.cfg.Batch)
+		cancel()
+		if err != nil {
+			log.Printf("rewards-emit: database read failed: %v", err)
+			return false
+		}
+		if len(rows) == 0 {
+			return true
+		}
+		batch := make([]wireEvent, 0, len(rows))
+		ids := make([]string, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.ID) // unreadable rows are removed too
+			var w wireEvent
+			if json.Unmarshal(r.Payload, &w) == nil {
+				batch = append(batch, w)
+			}
+		}
+		if len(batch) > 0 && !c.post(batch) {
+			return false
+		}
+		c.sent.Add(int64(len(batch)))
+		ctx, cancel = dbctx()
+		err = st.remove(ctx, c.cfg.Source, ids)
+		cancel()
+		if err != nil {
+			log.Printf("rewards-emit: database delete failed: %v", err)
+			return false
+		}
+	}
+}
+
 func (c *Client) run() {
 	defer c.wg.Done()
 	t := time.NewTicker(c.cfg.Flush)
 	defer t.Stop()
-	var buf []wireEvent
+	var buf []wireEvent // memory queue: everything without a database, the overflow with one
 	backoff := time.Duration(0)
 	var next time.Time
+	lastConn := time.Now()
+	// drainMem moves memory-held events into the database once it is there.
+	drainMem := func() {
+		if c.store() == nil {
+			return
+		}
+		for len(buf) > 0 && c.persist(buf[0]) {
+			buf = buf[1:]
+		}
+	}
 	flush := func(final bool) {
+		if c.cfg.DatabaseURL != "" && c.store() == nil && !final && time.Since(lastConn) > 15*time.Second {
+			lastConn = time.Now()
+			c.connect()
+		}
+		drainMem()
+		if st := c.store(); st != nil {
+			if final || !time.Now().Before(next) {
+				if c.deliverDB(st) {
+					backoff = 0
+				} else if !final {
+					backoff = min(max(backoff*2, time.Second), time.Minute)
+					next = time.Now().Add(backoff)
+				}
+			}
+			if len(buf) == 0 {
+				return
+			}
+		}
 		for len(buf) > 0 && (final || !time.Now().Before(next)) {
 			n := min(len(buf), c.cfg.Batch)
 			if c.post(buf[:n]) {
@@ -205,11 +376,17 @@ func (c *Client) run() {
 			return
 		}
 	}
+	add := func(w wireEvent) {
+		if len(buf) == 0 && c.persist(w) {
+			return
+		}
+		buf = append(buf, w)
+	}
 	for {
 		select {
 		case w := <-c.q:
-			buf = append(buf, w)
-			if len(buf) >= c.cfg.Batch {
+			add(w)
+			if c.store() == nil && len(buf) >= c.cfg.Batch {
 				flush(false)
 			}
 		case <-t.C:
@@ -218,13 +395,16 @@ func (c *Client) run() {
 			for {
 				select {
 				case w := <-c.q:
-					buf = append(buf, w)
+					add(w)
 					continue
 				default:
 				}
 				break
 			}
 			flush(true)
+			if st := c.store(); st != nil && c.cfg.store == nil {
+				st.close()
+			}
 			return
 		}
 	}
