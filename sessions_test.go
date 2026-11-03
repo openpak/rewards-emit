@@ -88,3 +88,28 @@ func TestRegistrySnapshot(t *testing.T) {
 		t.Fatal("empty room kept")
 	}
 }
+
+func TestSessionsRestartKeepsClock(t *testing.T) {
+	c, events := collect(t)
+	a, b := Identity{"switch", "a"}, Identity{"switch", "b"}
+	room := []Room{{ID: "r", Players: []Identity{a, b}}}
+	t0 := time.Now()
+	s1 := NewSessions(c, "m", 3*time.Minute)
+	s1.Tick(t0, room)
+	saved := s1.State()
+	// restart: a new process restores the saved clock
+	s2 := NewSessions(c, "m", 3*time.Minute)
+	s2.Restore(saved)
+	if n := s2.Tick(t0.Add(3*time.Minute), room); n != 2 {
+		t.Fatalf("clock lost over restart: %d", n)
+	}
+	saved = s2.State()
+	s3 := NewSessions(c, "m", 3*time.Minute)
+	s3.Restore(saved)
+	if n := s3.Tick(t0.Add(9*time.Minute), room); n != 0 {
+		t.Fatalf("re-emitted after restart: %d", n)
+	}
+	if len(events()) != 2 {
+		t.Fatal("events")
+	}
+}

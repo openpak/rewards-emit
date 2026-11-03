@@ -30,3 +30,7 @@ unbroken time with at least one other mapped player. `snapshot` returns `[]emit.
 a host that only sees join and leave events can keep an `emit.Registry` and pass `Registry.Snapshot`. Room ids
 must be unique over time (they are the dedupe key). For a Switch title the identity is
 `{Namespace: "switch", Subject: <BAAS user id>}`.
+
+Durable clock: `Sessions.State()` / `Restore(State)` (JSON-friendly) and `SetOnTick(func(State))` let a host keep the
+clock in Postgres so a restart loses no half-served session. Rewards dedupes event ids for 60 days, so a restored
+"emitted" set is belt and braces.

@@ -34,6 +34,7 @@ type Sessions struct {
 	min     time.Duration
 	since   map[string]time.Time
 	emitted map[string]bool
+	onTick  func(State)
 }
 
 // NewSessions reports through rw under metric (for example "game_sessions.outbound"). min <= 0 uses SessionMin().
@@ -88,6 +89,40 @@ func (s *Sessions) Tick(now time.Time, rooms []Room) int {
 	return n
 }
 
+// State is the session clock as plain data (room/player key -> since, and which keys already emitted),
+// for a host to keep in its durable store (Postgres) so a restart loses nothing.
+type State struct {
+	Since   map[string]time.Time `json:"since"`
+	Emitted []string             `json:"emitted"`
+}
+
+// State copies the clock. Call it after each Tick and save it when it changed.
+func (s *Sessions) State() State {
+	st := State{Since: make(map[string]time.Time, len(s.since))}
+	for k, v := range s.since {
+		st.Since[k] = v
+	}
+	for k := range s.emitted {
+		st.Emitted = append(st.Emitted, k)
+	}
+	sort.Strings(st.Emitted)
+	return st
+}
+
+// Restore loads a saved clock before the first Tick. Keys for rooms that are gone are dropped by the next Tick.
+func (s *Sessions) Restore(st State) {
+	for k, v := range st.Since {
+		s.since[k] = v
+	}
+	for _, k := range st.Emitted {
+		s.emitted[k] = true
+	}
+}
+
+// OnTick, when set, is called by Watch after every tick with the clock, so the host can save it.
+// (Set it before Watch.)
+func (s *Sessions) SetOnTick(f func(State)) { s.onTick = f }
+
 // Watch calls snapshot every `every` (default 20 s) and ticks until ctx ends. With rewards disabled
 // it returns at once and snapshot is never called. The room id must be unique over time (add the
 // room's creation time or a counter if the host reuses names), because it is the dedupe key.
@@ -103,6 +138,9 @@ func (s *Sessions) Watch(ctx context.Context, every time.Duration, snapshot func
 		defer t.Stop()
 		for {
 			s.Tick(time.Now(), snapshot())
+			if s.onTick != nil {
+				s.onTick(s.State())
+			}
 			select {
 			case <-t.C:
 			case <-ctx.Done():
